@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.64"
 keywords = ["LCDSmartie"]
 categories = ["api-bindings", "no-std", "os::windows-apis"]
+repository = "https://github.com/ChlorideCull/lcdsmartie-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
