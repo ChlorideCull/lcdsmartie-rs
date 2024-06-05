@@ -15,10 +15,12 @@
 extern crate alloc;
 
 mod winapi;
-mod short_string;
+mod ansi_string;
+mod errors;
 
 use alloc::string::String;
-pub use short_string::ShortString;
+pub use ansi_string::AnsiString;
+pub use errors::Error;
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -26,7 +28,7 @@ extern crate std;
 /// Trait representing the implementation of an LCDSmartie plugin.
 /// 
 /// # Important
-/// LCDSmartie is single threaded, so none of the functions it calls should take long to run,
+/// LCDSmartie is (mostly) single threaded, so none of the functions it calls should take long to run,
 /// or the UI will freeze for the user.
 /// 
 /// In addition, please remember that **any panic will cause LCDSmartie to crash.**
@@ -40,9 +42,9 @@ pub trait Plugin {
     /// Version, as shown in the Setup window in LCDSmartie.
     fn version(&self) -> &'static str;
     
-    /// The documentation shown in the Setup window as samples. Lines should be separated by CRLF.
+    /// The documentation shown in the Setup window as samples. Individual lines.
     /// Lines can be clicked in the UI to insert them in the current screen.
-    fn documentation(&self) -> ShortString;
+    fn documentation(&self) -> &'static [&'static str];
 
     /// The plugin defined "minimum refresh interval".
     /// LCDSmartie will call your plugin every `max(user_preferences, minimum_refresh_interval_ms)` milliseconds.
@@ -52,9 +54,12 @@ pub trait Plugin {
     /// Errors will be formatted appropriately.
     ///
     /// # Important
-    /// LCDSmartie is single threaded, so none of the functions it calls should take long to run,
+    /// LCDSmartie is (mostly) single threaded, so none of the functions it calls should take long to run,
     /// or the UI will freeze for the user.
-    fn function_router(&self, fid: u8, param1: &str, param2: &str) -> Result<ShortString, String>;
+    /// 
+    /// # Safety
+    /// This function may be called at the same time, even if unlikely, from multiple threads.
+    fn function_router(&mut self, fid: u8, param1: &str, param2: &str) -> Result<AnsiString, String>;
 }
 
 /// Macro to define a plugin. Takes one parameter - a type that implements the [Plugin] trait.
@@ -66,9 +71,10 @@ pub trait Plugin {
 macro_rules! define_plugin {
     ($plug:ty) => {
         use $crate::Plugin;
+        extern crate alloc;
 
         static mut PLUGIN: Option<core::cell::RefCell<$plug>> = None;
-        static mut OUTPUT_DATA: [u8; 256] = [0; 256];
+        static mut OUTPUT_DATA: [u8; 4096] = [0; 4096];
     
         #[no_mangle]
         pub unsafe extern "stdcall" fn SmartieInit() {
@@ -81,20 +87,38 @@ macro_rules! define_plugin {
         }
         
         #[no_mangle]
-        pub unsafe extern "stdcall" fn SmartieInfo() -> *const c_char {
+        pub unsafe extern "stdcall" fn SmartieInfo() -> *const core::ffi::c_char {
             let plug = PLUGIN.as_ref().unwrap().borrow();
-            let info = std::format!("Developer: {}\r\nVersion: {}", plug.developer(), plug.version());
-            let retval: $crate::ShortString = info.as_str().try_into().unwrap_or("[Err: Failed to convert info line]".try_into().unwrap());
-            let retvala = retval.as_arr();
+            let info = alloc::format!("Developer: {}\r\nVersion: {}", plug.developer(), plug.version());
+            let retval: Result<$crate::AnsiString, _> = info.as_str().try_into();
+            let unwrapped_retval: $crate::AnsiString;
+            if let Err(e) = retval {
+                let error = alloc::format!("[Err: {}]", e);
+                unwrapped_retval = error.as_str().try_into().unwrap_or("[Err: Failed to display error]".try_into().unwrap());
+            } else {
+                unwrapped_retval = retval.ok().unwrap();
+            }
+            let retvala = unwrapped_retval.as_slice(Some(OUTPUT_DATA.len()-1));
             OUTPUT_DATA[..retvala.len()].copy_from_slice(retvala);
+            OUTPUT_DATA[retvala.len()] = 0;
             return OUTPUT_DATA.as_ptr().cast();
         }
         
         #[no_mangle]
-        pub unsafe extern "stdcall" fn SmartieDemo() -> *const c_char {
-            let retval = PLUGIN.as_ref().unwrap().borrow().documentation();
-            let retvala = retval.as_arr();
+        pub unsafe extern "stdcall" fn SmartieDemo() -> *const core::ffi::c_char {
+            let doc = PLUGIN.as_ref().unwrap().borrow().documentation();
+            let doc = doc.join("\r\n");
+            let retval: Result<$crate::AnsiString, _> = doc.as_str().try_into();
+            let unwrapped_retval: $crate::AnsiString;
+            if let Err(e) = retval {
+                let error = alloc::format!("[Err: {}]", e);
+                unwrapped_retval = error.as_str().try_into().unwrap_or("[Err: Failed to display error]".try_into().unwrap());
+            } else {
+                unwrapped_retval = retval.ok().unwrap();
+            }
+            let retvala = unwrapped_retval.as_slice(Some(OUTPUT_DATA.len()-1));
             OUTPUT_DATA[..retvala.len()].copy_from_slice(retvala);
+            OUTPUT_DATA[retvala.len()] = 0;
             return OUTPUT_DATA.as_ptr().cast();
         }
         
@@ -132,21 +156,22 @@ macro_rules! define_plugin {
 macro_rules! function_n {
     ($name:ident, $n:literal) => {
         #[no_mangle]
-        pub unsafe extern "stdcall" fn $name(param1: *const c_char, param2: *const c_char) -> *const c_char {
-            let param1c: $crate::ShortString = core::ffi::CStr::from_ptr(param1).into();
-            let param2c: $crate::ShortString = core::ffi::CStr::from_ptr(param2).into();
+        pub unsafe extern "stdcall" fn $name(param1: *const core::ffi::c_char, param2: *const core::ffi::c_char) -> *const core::ffi::c_char {
+            let param1c: $crate::AnsiString = core::ffi::CStr::from_ptr(param1).into();
+            let param2c: $crate::AnsiString = core::ffi::CStr::from_ptr(param2).into();
             let param1s: String = param1c.into();
             let param2s: String = param2c.into();
-            let retval = PLUGIN.as_ref().unwrap().borrow().function_router($n, &param1s, &param2s);
-            let unwrapped_retval: $crate::ShortString;
+            let retval = PLUGIN.as_ref().unwrap().borrow_mut().function_router($n, &param1s, &param2s);
+            let unwrapped_retval: $crate::AnsiString;
             if let Err(e) = retval {
                 let error = format!("[Err: {}]", e);
                 unwrapped_retval = error.as_str().try_into().unwrap_or("[Err: Failed to display error]".try_into().unwrap());
             } else {
                 unwrapped_retval = retval.ok().unwrap();
             }
-            let retvala = unwrapped_retval.as_arr();
+            let retvala = unwrapped_retval.as_slice(Some(OUTPUT_DATA.len()-1));
             OUTPUT_DATA[..retvala.len()].copy_from_slice(retvala);
+            OUTPUT_DATA[retvala.len()] = 0;
             return OUTPUT_DATA.as_ptr().cast();
         }
     }

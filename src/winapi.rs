@@ -1,120 +1,59 @@
-#![allow(non_snake_case)]
-#![allow(dead_code)]
-#![allow(non_camel_case_types)]
-// Here be ugly code
+use core::ptr;
+use windows_sys::{core::PCSTR, Win32::{Foundation::{GetLastError, BOOL, FALSE, TRUE}, Globalization::{MultiByteToWideChar, WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS}}};
+use crate::Error as LcdSmartieError;
 
-use core::{ffi::c_char, ptr};
-
-pub const FALSE: i32 = 0;
-pub const TRUE: i32 = 1;
-pub const MB_PRECOMPOSED: u32 = 1;
-pub const MB_COMPOSITE: u32 = 2;
-pub const MB_USEGLYPHCHARS: u32 = 4;
-pub const MB_ERR_INVALID_CHARS: u32 = 8;
-pub const CP_INSTALLED: u32 = 1;
-pub const CP_SUPPORTED: u32 = 2;
-pub const CP_ACP: u32 = 0;
-pub const CP_OEMCP: u32 = 1;
-pub const CP_MACCP: u32 = 2;
-pub const CP_THREAD_ACP: u32 = 3;
-pub const CP_SYMBOL: u32 = 42;
-pub const CP_UTF7: u32 = 65000;
-pub const CP_UTF8: u32 = 65001;
-pub const WC_COMPOSITECHECK: u32 = 512;
-pub const WC_DISCARDNS: u32 = 16;
-pub const WC_SEPCHARS: u32 = 32;
-pub const WC_DEFAULTCHAR: u32 = 64;
-pub const WC_ERR_INVALID_CHARS: u32 = 128;
-pub const WC_NO_BEST_FIT_CHARS: u32 = 1024;
-pub type DWORD = ::core::ffi::c_ulong;
-pub type BOOL = ::core::ffi::c_int;
-pub type LPBOOL = *mut BOOL;
-pub type UINT = ::core::ffi::c_uint;
-pub type wchar_t = ::core::ffi::c_ushort;
-pub type CHAR = ::core::ffi::c_char;
-pub type WCHAR = wchar_t;
-pub type LPCWCH = *const WCHAR;
-pub type LPWSTR = *mut WCHAR;
-pub type LPCCH = *const CHAR;
-pub type LPSTR = *mut CHAR;
-#[link(name = "kernel32")]
-extern "C" {
-    pub fn MultiByteToWideChar(
-        CodePage: UINT,
-        dwFlags: DWORD,
-        lpMultiByteStr: LPCCH,
-        cbMultiByte: ::core::ffi::c_int,
-        lpWideCharStr: LPWSTR,
-        cchWideChar: ::core::ffi::c_int,
-    ) -> ::core::ffi::c_int;
-}
-#[link(name = "kernel32")]
-extern "C" {
-    pub fn WideCharToMultiByte(
-        CodePage: UINT,
-        dwFlags: DWORD,
-        lpWideCharStr: LPCWCH,
-        cchWideChar: ::core::ffi::c_int,
-        lpMultiByteStr: LPSTR,
-        cbMultiByte: ::core::ffi::c_int,
-        lpDefaultChar: *const CHAR,
-        lpUsedDefaultChar: *mut BOOL,
-    ) -> ::core::ffi::c_int;
-}
-#[link(name = "kernel32")]
-extern "C" {
-    pub fn GetLastError() -> DWORD;
-}
-
-pub fn WideCharToMultiByte_Safe(
-    code_page: UINT,
-    flags: DWORD,
+pub fn utf16_to_code_page(
+    code_page: u32,
     wide_string: &[u16],
     out_multi_byte_string: &mut [u8],
-    default_char: Option<&c_char>,
-    out_default_char_used: Option<&mut bool>,
-) -> Result<usize, DWORD> {
+) -> Result<usize, LcdSmartieError> {
     if wide_string.len() == 0 {
         // Native API bails on empty strings, but an empty string translates to an empty string :)
         return Ok(0);
     }
-    let default_char_mapped: *const CHAR = match default_char {
-        Some(c) => c,
-        None => ptr::null()
-    };
+    let default_char_mapped: PCSTR = ptr::null();
     let mut default_char_used: BOOL = FALSE;
-    let res = unsafe { WideCharToMultiByte(code_page, flags, wide_string.as_ptr(), wide_string.len().try_into().unwrap(), out_multi_byte_string.as_mut_ptr().cast(), out_multi_byte_string.len().try_into().unwrap(), default_char_mapped, &mut default_char_used) };
+    let res = unsafe { WideCharToMultiByte(code_page, WC_NO_BEST_FIT_CHARS, wide_string.as_ptr(), wide_string.len().try_into().unwrap(), out_multi_byte_string.as_mut_ptr().cast(), out_multi_byte_string.len().try_into().unwrap(), default_char_mapped, &mut default_char_used) };
     let errorcode = unsafe { GetLastError() };
     if res == 0 && errorcode != 0 {
-        return Err(errorcode);
+        return Err(LcdSmartieError::Win32Error(errorcode));
     }
-    if let Some(c) = out_default_char_used {
-        *c = default_char_used == TRUE;
+    if default_char_used == TRUE {
+        return Err(LcdSmartieError::AnsiConversionError);
     }
     return Ok(res.try_into().unwrap());
 }
 
-pub fn MultiByteToWideChar_Safe(
-    code_page: UINT,
-    flags: DWORD,
+pub fn utf16_to_ansi(
+    wide_string: &[u16],
+    out_multi_byte_string: &mut [u8],
+) -> Result<usize, LcdSmartieError> {
+    utf16_to_code_page(CP_ACP, wide_string, out_multi_byte_string)
+}
+
+pub fn code_page_to_utf16(
+    code_page: u32,
     multi_byte_string: &[u8],
     out_wide_string: &mut [u16]
-) -> Result<usize, DWORD> {
-    let strlen = multi_byte_string.iter().position(|&x| x == 0x00);
-    if strlen.is_none() {
-        return Err(0x57); // ERROR_INVALID_PARAMETER - input string does not have a null terminator
-    }
-    let strlen = strlen.unwrap();
+) -> Result<usize, LcdSmartieError> {
+    let strlen = multi_byte_string.len();
     if strlen == 0 {
         // Native API bails on empty strings, but an empty string translates to an empty string :)
         return Ok(0);
     }
-    let res = unsafe { MultiByteToWideChar(code_page, flags, multi_byte_string.as_ptr().cast(), strlen.try_into().unwrap(), out_wide_string.as_mut_ptr(), out_wide_string.len().try_into().unwrap()) };
+    let res = unsafe { MultiByteToWideChar(code_page, 0, multi_byte_string.as_ptr().cast(), strlen.try_into().unwrap(), out_wide_string.as_mut_ptr(), out_wide_string.len().try_into().unwrap()) };
     let errorcode = unsafe { GetLastError() };
     if res == 0 && errorcode != 0 {
-        return Err(errorcode);
+        return Err(LcdSmartieError::Win32Error(errorcode));
     }
     return Ok(res.try_into().unwrap());
+}
+
+pub fn ansi_to_utf16(
+    multi_byte_string: &[u8],
+    out_wide_string: &mut [u16]
+) -> Result<usize, LcdSmartieError> {
+    code_page_to_utf16(CP_ACP, multi_byte_string, out_wide_string)
 }
 
 #[cfg(test)]
@@ -122,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn WideCharToMultiByte_Safe_Basic() {
+    fn utf16_to_code_page_works_with_simple_string() {
         const TESTSTRING: &str = "test";
         const STRLEN: usize = TESTSTRING.len();
         let mut widedata: [u16; STRLEN+1] = [0; STRLEN+1];
@@ -132,17 +71,15 @@ mod tests {
             widedata_used += 1;
         }
         let mut outdata: [u8; 256] = [0; 256];
-        let mut converted_lossy: bool = false;
 
-        let res = WideCharToMultiByte_Safe(1252, WC_NO_BEST_FIT_CHARS, &widedata[..widedata_used], &mut outdata, None, Some(&mut converted_lossy));
-        assert_eq!(converted_lossy, false);
+        let res = utf16_to_code_page(1252, &widedata[..widedata_used], &mut outdata);
         assert_eq!(res.is_err(), false);
         assert_eq!(res.unwrap(), 4);
         assert!(outdata[..5] == [0x74, 0x65, 0x73, 0x74, 0x00]);
     }
 
     #[test]
-    fn WideCharToMultiByte_Safe_ProperlyFlagsLossyConversions() {
+    fn utf16_to_code_page_errors_on_lossy_conversions() {
         const TESTSTRING: &str = "فلسطين ستتحرر";
         let mut widedata: [u16; 256] = [0; 256];
         let mut widedata_used: usize = 0;
@@ -151,15 +88,14 @@ mod tests {
             widedata_used += 1;
         }
         let mut outdata: [u8; 256] = [0; 256];
-        let mut converted_lossy: bool = false;
 
-        let res = WideCharToMultiByte_Safe(1252, WC_NO_BEST_FIT_CHARS, &widedata[..widedata_used], &mut outdata, None, Some(&mut converted_lossy));
-        assert_eq!(converted_lossy, true);
-        assert_eq!(res.is_err(), false);
+        let res = utf16_to_code_page(1252, &widedata[..widedata_used], &mut outdata);
+        assert_eq!(res.is_err(), true);
+        assert_eq!(res.err().unwrap(), LcdSmartieError::AnsiConversionError);
     }
 
     #[test]
-    fn WideCharToMultiByte_Safe_Empty() {
+    fn utf16_to_code_page_works_on_empty_strings() {
         const TESTSTRING: &str = "";
         const STRLEN: usize = TESTSTRING.len();
         let mut widedata: [u16; STRLEN+1] = [0; STRLEN+1];
@@ -169,10 +105,8 @@ mod tests {
             widedata_used += 1;
         }
         let mut outdata: [u8; 256] = [0; 256];
-        let mut converted_lossy: bool = false;
 
-        let res = WideCharToMultiByte_Safe(1252, WC_NO_BEST_FIT_CHARS, &widedata[..widedata_used], &mut outdata, None, Some(&mut converted_lossy));
-        assert_eq!(converted_lossy, false);
+        let res = utf16_to_code_page(1252, &widedata[..widedata_used], &mut outdata);
         assert_eq!(res.is_err(), false);
         assert_eq!(res.unwrap(), 0);
         assert!(outdata[0] == 0x00);
